@@ -55,6 +55,7 @@
     min-height: 260px;
   }
   canvas { width: 100%; height: 100%; display: block; }
+  .stage { position: relative; }
   .stats {
     display: flex; gap: 20px; flex-wrap: wrap; justify-content: center;
     color: var(--muted); font-variant-numeric: tabular-nums;
@@ -83,12 +84,13 @@
     <span>Iteration <b id="lvl">0</b></span>
     <span>Segments <b id="segs">3</b></span>
     <span>Perimeter <b id="per">1.000</b>× initial</span>
+    <span>Zoom <b id="zoom">1</b>×</span>
   </div>
   <div class="controls">
     <button id="play" class="primary">Pause</button>
     <button id="step">Step</button>
     <button id="reset">Reset</button>
-    <label>Max iterations <input id="max" type="range" min="1" max="7" value="6"><span id="maxv">6</span></label>
+    <label>Max iterations <input id="max" type="range" min="1" max="12" value="10"><span id="maxv">10</span></label>
     <label>Speed <input id="speed" type="range" min="1" max="10" value="5"></label>
   </div>
 
@@ -100,6 +102,7 @@
     lvl: document.getElementById("lvl"),
     segs: document.getElementById("segs"),
     per: document.getElementById("per"),
+    zoom: document.getElementById("zoom"),
     play: document.getElementById("play"),
     step: document.getElementById("step"),
     reset: document.getElementById("reset"),
@@ -109,49 +112,97 @@
   };
 
   const SIN60 = Math.sqrt(3) / 2;
+  const HOLD_MS = 700;
+  const ZOOM_OUT_MS_PER_STEP = 450; // zoom-out time per factor of 3
+  // Zooming starts with iteration 7. During that iteration the view zooms in
+  // by 3^ZOOM_FIRST so the new bumps become visible, then by 3× per iteration
+  // so each new generation of bumps appears at the same on-screen size.
+  const ZOOM_FROM = 6;
+  const ZOOM_FIRST = 3;
 
   // Equilateral triangle in unit coordinates, centred on the origin.
   // Vertices run clockwise on screen (y down), so the Koch bumps point outward.
-  function baseTriangle() {
-    const pts = [];
-    for (let i = 0; i < 3; i++) {
-      const a = -Math.PI / 2 + i * (2 * Math.PI / 3);
-      pts.push([Math.cos(a), Math.sin(a)]);
-    }
-    return pts;
-  }
+  const TRI = [0, 1, 2].map(i => {
+    const a = -Math.PI / 2 + i * (2 * Math.PI / 3);
+    return [Math.cos(a), Math.sin(a)];
+  });
 
-  // Replace every edge A→B with A, P1, peak, P2. The peak rises from the
-  // edge midpoint (t = 0) to the tip of the equilateral bump (t = 1).
-  function subdivide(pts, t) {
-    const out = [];
-    const n = pts.length;
-    for (let i = 0; i < n; i++) {
-      const [ax, ay] = pts[i];
-      const [bx, by] = pts[(i + 1) % n];
+  // A point on the limit curve of the first edge, `u` of the way along it
+  // (measured in Koch-curve parameter). This is where the camera zooms in; an
+  // irrational `u` keeps the local shape changing from one depth to the next.
+  const TARGET = (() => {
+    let [ax, ay] = TRI[0], [bx, by] = TRI[1], u = (Math.sqrt(5) - 1) / 2;
+    for (let i = 0; i < 40; i++) {
       const dx = (bx - ax) / 3, dy = (by - ay) / 3;
-      const p1x = ax + dx, p1y = ay + dy;
-      const p2x = ax + 2 * dx, p2y = ay + 2 * dy;
-      // Outward normal for a clockwise (screen-space) polygon.
-      const h = SIN60 * t;
-      const mx = (p1x + p2x) / 2, my = (p1y + p2y) / 2;
-      out.push([ax, ay], [p1x, p1y], [mx + dy * h, my - dx * h], [p2x, p2y]);
+      const pts = [
+        [ax, ay], [ax + dx, ay + dy],
+        [ax + 1.5 * dx + dy * SIN60, ay + 1.5 * dy - dx * SIN60],
+        [ax + 2 * dx, ay + 2 * dy], [bx, by],
+      ];
+      const k = Math.min(3, Math.floor(u * 4));
+      u = u * 4 - k;
+      [ax, ay] = pts[k];
+      [bx, by] = pts[k + 1];
     }
-    return out;
+    return [ax, ay];
+  })();
+
+  // Current view transform (screen = o + world * s) and clip rectangle,
+  // shared with seg() to keep the recursion cheap.
+  let ox = 0, oy = 0, vs = 1, clipX0 = 0, clipY0 = 0, clipX1 = 0, clipY1 = 0, lod = 1, bumpT = 1;
+
+  // Draw one Koch edge A→B refined `n` more times. The deepest level's bumps
+  // are scaled by bumpT so they can grow in. Edges that are off screen or
+  // shorter than `lod` pixels are drawn as a straight chord; the Koch curve
+  // over an edge stays within a disc of radius |AB|/2 about its midpoint,
+  // so culled chords never cross the visible area.
+  function seg(ax, ay, bx, by, n) {
+    const sbx = ox + bx * vs, sby = oy + by * vs;
+    if (n > 0) {
+      const sax = ox + ax * vs, say = oy + ay * vs;
+      const len = Math.hypot(sbx - sax, sby - say);
+      const mx = (sax + sbx) / 2, my = (say + sby) / 2, r = len * 0.55;
+      if (len >= lod && mx + r > clipX0 && mx - r < clipX1 && my + r > clipY0 && my - r < clipY1) {
+        const dx = (bx - ax) / 3, dy = (by - ay) / 3;
+        const h = SIN60 * (n === 1 ? bumpT : 1);
+        const p1x = ax + dx, p1y = ay + dy, p2x = ax + 2 * dx, p2y = ay + 2 * dy;
+        const px = ax + 1.5 * dx + dy * h, py = ay + 1.5 * dy - dx * h;
+        seg(ax, ay, p1x, p1y, n - 1);
+        seg(p1x, p1y, px, py, n - 1);
+        seg(px, py, p2x, p2y, n - 1);
+        seg(p2x, p2y, bx, by, n - 1);
+        return;
+      }
+    }
+    ctx.lineTo(sbx, sby);
   }
 
-  const levels = [baseTriangle()];
-  function levelPts(k) {
-    while (levels.length <= k) levels.push(subdivide(levels[levels.length - 1], 1));
-    return levels[k];
+  function snowflakePath(depth, t) {
+    bumpT = t;
+    ctx.beginPath();
+    ctx.moveTo(ox + TRI[0][0] * vs, oy + TRI[0][1] * vs);
+    for (let i = 0; i < 3; i++) {
+      const a = TRI[i], b = TRI[(i + 1) % 3];
+      seg(a[0], a[1], b[0], b[1], depth);
+    }
+    ctx.closePath();
+  }
+
+  // Zoom exponent (base 3) as a function of the continuous iteration count.
+  function zoomExp(x) {
+    if (x <= ZOOM_FROM) return 0;
+    if (x <= ZOOM_FROM + 1) return (x - ZOOM_FROM) * ZOOM_FIRST;
+    return ZOOM_FIRST + (x - ZOOM_FROM - 1);
   }
 
   // Animation state: `level` is the completed iteration, `progress` (0..1)
-  // is how far the next iteration's bumps have grown.
-  let level = 0, progress = 0, playing = true, hold = 0, last = performance.now();
-  const HOLD_MS = 700;
+  // is how far the next iteration's bumps have grown, and `zoomOut` (0..1)
+  // is how far the camera has pulled back after the last iteration.
+  let level = 0, progress = 0, zoomOut = 0, playing = true, hold = HOLD_MS, last = performance.now();
 
   function css(name) { return getComputedStyle(document.documentElement).getPropertyValue(name).trim(); }
+  function easeInOut(t) { return t < 0.5 ? 2 * t * t : 1 - (-2 * t + 2) ** 2 / 2; }
+  function maxLevel() { return +ui.max.value; }
 
   function resize() {
     const r = canvas.getBoundingClientRect();
@@ -163,41 +214,100 @@
 
   function draw() {
     const w = canvas.width, h = canvas.height;
+    const dpr = window.devicePixelRatio || 1;
+    const accent = css("--accent"), fill = css("--fill");
     ctx.clearRect(0, 0, w, h);
-    const pts = progress > 0 ? subdivide(levelPts(level), easeInOut(progress)) : levelPts(level);
 
-    // Every level of the snowflake fits inside the unit circle.
-    const scale = Math.min(w, h) / 2 / 1.06;
-    const cx = w / 2, cy = h / 2;
+    const t = easeInOut(progress);
+    const depth = progress > 0 ? level + 1 : level;
+    const zexp = zoomExp(level + t) * (1 - easeInOut(zoomOut));
+    const z = 3 ** zexp;
 
-    ctx.beginPath();
-    ctx.moveTo(cx + pts[0][0] * scale, cy + pts[0][1] * scale);
-    for (let i = 1; i < pts.length; i++) ctx.lineTo(cx + pts[i][0] * scale, cy + pts[i][1] * scale);
-    ctx.closePath();
-    ctx.fillStyle = css("--fill");
+    // Zoom about the target, gliding it from its unzoomed screen position to
+    // the centre over the first zoom step and keeping it centred after that.
+    const base = Math.min(w, h) / 2 / 1.06;
+    const f = easeInOut(Math.min(1, zexp / ZOOM_FIRST));
+    vs = base * z;
+    ox = w / 2 + TARGET[0] * (base * (1 - f) - vs);
+    oy = h / 2 + TARGET[1] * (base * (1 - f) - vs);
+    const cx = (w / 2 - ox) / vs, cy = (h / 2 - oy) / vs;
+    clipX0 = -4; clipY0 = -4; clipX1 = w + 4; clipY1 = h + 4;
+    lod = dpr;
+
+    snowflakePath(depth, progress > 0 ? t : 1);
+    ctx.fillStyle = fill;
     ctx.fill();
     ctx.lineJoin = "round";
-    ctx.lineWidth = Math.max(1, (window.devicePixelRatio || 1) * (level < 4 ? 2 : 1.25));
-    ctx.strokeStyle = css("--accent");
+    ctx.lineWidth = Math.max(1, dpr * (z > 1 || level >= 4 ? 1.5 : 2));
+    ctx.strokeStyle = accent;
     ctx.stroke();
 
-    const shown = progress > 0 ? level + 1 : level;
-    ui.lvl.textContent = shown;
-    ui.segs.textContent = (3 * 4 ** shown).toLocaleString();
-    ui.per.textContent = ((4 / 3) ** shown).toFixed(3);
+    if (zexp > 0.01) drawInset(w, h, dpr, depth, cx, cy, accent, fill);
+
+    ui.lvl.textContent = depth;
+    ui.segs.textContent = (3 * 4 ** depth).toLocaleString();
+    ui.per.textContent = ((4 / 3) ** depth).toFixed(3);
+    ui.zoom.textContent = z < 10 ? z.toFixed(1) : Math.round(z).toLocaleString();
   }
 
-  function easeInOut(t) { return t < 0.5 ? 2 * t * t : 1 - (-2 * t + 2) ** 2 / 2; }
+  // Overview of the whole snowflake with the zoomed region marked.
+  function drawInset(w, h, dpr, depth, cx, cy, accent, fill) {
+    const mainS = vs, mainOx = ox, mainOy = oy;
+    const size = Math.round(Math.min(130 * dpr, Math.min(w, h) * 0.3));
+    const x0 = 8 * dpr, y0 = 8 * dpr;
 
-  function maxLevel() { return +ui.max.value; }
+    ctx.save();
+    ctx.fillStyle = css("--panel");
+    ctx.strokeStyle = css("--border");
+    ctx.lineWidth = dpr;
+    ctx.fillRect(x0, y0, size, size);
+    ctx.strokeRect(x0 + 0.5, y0 + 0.5, size - 1, size - 1);
+
+    vs = size / 2 / 1.12;
+    ox = x0 + size / 2;
+    oy = y0 + size / 2;
+    clipX0 = x0; clipY0 = y0; clipX1 = x0 + size; clipY1 = y0 + size;
+    lod = 1.5 * dpr;
+    snowflakePath(Math.min(depth, 5), 1);
+    ctx.fillStyle = fill;
+    ctx.fill();
+    ctx.strokeStyle = accent;
+    ctx.lineWidth = dpr;
+    ctx.stroke();
+
+    // Visible region of the main view, in inset coordinates.
+    const rw = (w / mainS) * vs, rh = (h / mainS) * vs;
+    const rx = ox + cx * vs, ry = oy + cy * vs;
+    ctx.strokeStyle = css("--text");
+    ctx.lineWidth = 1.5 * dpr;
+    ctx.strokeRect(rx - rw / 2, ry - rh / 2, rw, rh);
+    if (rw < 10 * dpr) {
+      ctx.beginPath();
+      ctx.arc(rx, ry, 6 * dpr, 0, 2 * Math.PI);
+      ctx.stroke();
+    }
+    ctx.restore();
+
+    vs = mainS; ox = mainOx; oy = mainOy;
+  }
 
   function advance(dt) {
     if (hold > 0) { hold -= dt; return; }
-    if (level >= maxLevel()) { level = 0; progress = 0; hold = HOLD_MS; return; }
+    if (level >= maxLevel()) {
+      // Pull the camera back out, then start over.
+      const steps = zoomExp(level);
+      if (steps > 0 && zoomOut < 1) {
+        zoomOut = Math.min(1, zoomOut + dt / (ZOOM_OUT_MS_PER_STEP * steps));
+        if (zoomOut >= 1) hold = HOLD_MS * 1.5;
+        return;
+      }
+      level = 0; progress = 0; zoomOut = 0; hold = HOLD_MS;
+      return;
+    }
     progress += dt * +ui.speed.value / 2600;
     if (progress >= 1) {
       level++; progress = 0;
-      // Linger longer on the finished snowflake before starting over.
+      // Linger longer on the finished snowflake.
       hold = level >= maxLevel() ? HOLD_MS * 3 : HOLD_MS;
     }
   }
@@ -209,34 +319,33 @@
     requestAnimationFrame(frame);
   }
 
-  ui.play.addEventListener("click", () => {
-    playing = !playing;
-    ui.play.textContent = playing ? "Pause" : "Play";
-    ui.play.classList.toggle("primary", playing);
-  });
+  function setPlaying(on) {
+    playing = on;
+    ui.play.textContent = on ? "Pause" : "Play";
+    ui.play.classList.toggle("primary", on);
+  }
+
+  ui.play.addEventListener("click", () => setPlaying(!playing));
   ui.step.addEventListener("click", () => {
-    playing = false;
-    ui.play.textContent = "Play";
-    ui.play.classList.remove("primary");
+    setPlaying(false);
     hold = 0;
     if (progress > 0) { level++; progress = 0; }
-    else if (level < maxLevel()) level++;
-    else level = 0;
+    else if (level < maxLevel() && zoomOut === 0) level++;
+    else { level = 0; zoomOut = 0; }
     draw();
   });
   ui.reset.addEventListener("click", () => {
-    level = 0; progress = 0; hold = HOLD_MS;
+    level = 0; progress = 0; zoomOut = 0; hold = HOLD_MS;
     draw();
   });
   ui.max.addEventListener("input", () => {
     ui.maxv.textContent = ui.max.value;
-    if (level > maxLevel()) { level = maxLevel(); progress = 0; draw(); }
+    if (level > maxLevel()) { level = maxLevel(); progress = 0; zoomOut = 0; draw(); }
   });
   window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", draw);
   new ResizeObserver(resize).observe(canvas);
 
   resize();
-  hold = HOLD_MS;
   requestAnimationFrame(frame);
 })();
 </script>
