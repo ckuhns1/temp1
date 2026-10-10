@@ -1,0 +1,244 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Koch Snowflake</title>
+<style>
+  :root {
+    --bg: #f6f7fb;
+    --panel: #ffffff;
+    --text: #1d2433;
+    --muted: #5b6475;
+    --accent: #2f6fe4;
+    --fill: rgba(47, 111, 228, 0.10);
+    --border: #dde1ea;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #0e1220;
+      --panel: #161b2c;
+      --text: #e6e9f2;
+      --muted: #9aa3b8;
+      --accent: #7fb0ff;
+      --fill: rgba(127, 176, 255, 0.12);
+      --border: #2a3147;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #0e1220;
+    --panel: #161b2c;
+    --text: #e6e9f2;
+    --muted: #9aa3b8;
+    --accent: #7fb0ff;
+    --fill: rgba(127, 176, 255, 0.12);
+    --border: #2a3147;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font: 15px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    padding: 16px;
+    gap: 12px;
+  }
+  h1 { font-size: 1.25rem; margin: 0; font-weight: 600; }
+  .stage {
+    width: 100%;
+    max-width: 720px;
+    aspect-ratio: 1 / 1;
+    max-height: calc(100vh - 190px);
+    min-height: 260px;
+  }
+  canvas { width: 100%; height: 100%; display: block; }
+  .stats {
+    display: flex; gap: 20px; flex-wrap: wrap; justify-content: center;
+    color: var(--muted); font-variant-numeric: tabular-nums;
+  }
+  .stats b { color: var(--text); font-weight: 600; }
+  .controls {
+    display: flex; gap: 10px; flex-wrap: wrap; justify-content: center; align-items: center;
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: 10px; padding: 10px 14px; max-width: 100%;
+  }
+  button {
+    font: inherit; color: var(--text); background: transparent;
+    border: 1px solid var(--border); border-radius: 6px;
+    padding: 6px 12px; cursor: pointer;
+  }
+  button:hover { border-color: var(--accent); }
+  button.primary { background: var(--accent); color: var(--bg); border-color: var(--accent); }
+  label { display: flex; align-items: center; gap: 6px; color: var(--muted); }
+  input[type="range"] { accent-color: var(--accent); width: 110px; }
+</style>
+</head>
+<body>
+  <h1>Koch Snowflake</h1>
+  <div class="stage"><canvas id="c"></canvas></div>
+  <div class="stats">
+    <span>Iteration <b id="lvl">0</b></span>
+    <span>Segments <b id="segs">3</b></span>
+    <span>Perimeter <b id="per">1.000</b>× initial</span>
+  </div>
+  <div class="controls">
+    <button id="play" class="primary">Pause</button>
+    <button id="step">Step</button>
+    <button id="reset">Reset</button>
+    <label>Max iterations <input id="max" type="range" min="1" max="7" value="6"><span id="maxv">6</span></label>
+    <label>Speed <input id="speed" type="range" min="1" max="10" value="5"></label>
+  </div>
+
+<script>
+(() => {
+  const canvas = document.getElementById("c");
+  const ctx = canvas.getContext("2d");
+  const ui = {
+    lvl: document.getElementById("lvl"),
+    segs: document.getElementById("segs"),
+    per: document.getElementById("per"),
+    play: document.getElementById("play"),
+    step: document.getElementById("step"),
+    reset: document.getElementById("reset"),
+    max: document.getElementById("max"),
+    maxv: document.getElementById("maxv"),
+    speed: document.getElementById("speed"),
+  };
+
+  const SIN60 = Math.sqrt(3) / 2;
+
+  // Equilateral triangle in unit coordinates, centred on the origin.
+  // Vertices run clockwise on screen (y down), so the Koch bumps point outward.
+  function baseTriangle() {
+    const pts = [];
+    for (let i = 0; i < 3; i++) {
+      const a = -Math.PI / 2 + i * (2 * Math.PI / 3);
+      pts.push([Math.cos(a), Math.sin(a)]);
+    }
+    return pts;
+  }
+
+  // Replace every edge A→B with A, P1, peak, P2. The peak rises from the
+  // edge midpoint (t = 0) to the tip of the equilateral bump (t = 1).
+  function subdivide(pts, t) {
+    const out = [];
+    const n = pts.length;
+    for (let i = 0; i < n; i++) {
+      const [ax, ay] = pts[i];
+      const [bx, by] = pts[(i + 1) % n];
+      const dx = (bx - ax) / 3, dy = (by - ay) / 3;
+      const p1x = ax + dx, p1y = ay + dy;
+      const p2x = ax + 2 * dx, p2y = ay + 2 * dy;
+      // Outward normal for a clockwise (screen-space) polygon.
+      const h = SIN60 * t;
+      const mx = (p1x + p2x) / 2, my = (p1y + p2y) / 2;
+      out.push([ax, ay], [p1x, p1y], [mx + dy * h, my - dx * h], [p2x, p2y]);
+    }
+    return out;
+  }
+
+  const levels = [baseTriangle()];
+  function levelPts(k) {
+    while (levels.length <= k) levels.push(subdivide(levels[levels.length - 1], 1));
+    return levels[k];
+  }
+
+  // Animation state: `level` is the completed iteration, `progress` (0..1)
+  // is how far the next iteration's bumps have grown.
+  let level = 0, progress = 0, playing = true, hold = 0, last = performance.now();
+  const HOLD_MS = 700;
+
+  function css(name) { return getComputedStyle(document.documentElement).getPropertyValue(name).trim(); }
+
+  function resize() {
+    const r = canvas.getBoundingClientRect();
+    const dpr = window.devicePixelRatio || 1;
+    canvas.width = Math.round(r.width * dpr);
+    canvas.height = Math.round(r.height * dpr);
+    draw();
+  }
+
+  function draw() {
+    const w = canvas.width, h = canvas.height;
+    ctx.clearRect(0, 0, w, h);
+    const pts = progress > 0 ? subdivide(levelPts(level), easeInOut(progress)) : levelPts(level);
+
+    // Every level of the snowflake fits inside the unit circle.
+    const scale = Math.min(w, h) / 2 / 1.06;
+    const cx = w / 2, cy = h / 2;
+
+    ctx.beginPath();
+    ctx.moveTo(cx + pts[0][0] * scale, cy + pts[0][1] * scale);
+    for (let i = 1; i < pts.length; i++) ctx.lineTo(cx + pts[i][0] * scale, cy + pts[i][1] * scale);
+    ctx.closePath();
+    ctx.fillStyle = css("--fill");
+    ctx.fill();
+    ctx.lineJoin = "round";
+    ctx.lineWidth = Math.max(1, (window.devicePixelRatio || 1) * (level < 4 ? 2 : 1.25));
+    ctx.strokeStyle = css("--accent");
+    ctx.stroke();
+
+    const shown = progress > 0 ? level + 1 : level;
+    ui.lvl.textContent = shown;
+    ui.segs.textContent = (3 * 4 ** shown).toLocaleString();
+    ui.per.textContent = ((4 / 3) ** shown).toFixed(3);
+  }
+
+  function easeInOut(t) { return t < 0.5 ? 2 * t * t : 1 - (-2 * t + 2) ** 2 / 2; }
+
+  function maxLevel() { return +ui.max.value; }
+
+  function advance(dt) {
+    if (hold > 0) { hold -= dt; return; }
+    if (level >= maxLevel()) { level = 0; progress = 0; hold = HOLD_MS; return; }
+    progress += dt * +ui.speed.value / 2600;
+    if (progress >= 1) {
+      level++; progress = 0;
+      // Linger longer on the finished snowflake before starting over.
+      hold = level >= maxLevel() ? HOLD_MS * 3 : HOLD_MS;
+    }
+  }
+
+  function frame(now) {
+    const dt = Math.min(now - last, 100);
+    last = now;
+    if (playing) { advance(dt); draw(); }
+    requestAnimationFrame(frame);
+  }
+
+  ui.play.addEventListener("click", () => {
+    playing = !playing;
+    ui.play.textContent = playing ? "Pause" : "Play";
+    ui.play.classList.toggle("primary", playing);
+  });
+  ui.step.addEventListener("click", () => {
+    playing = false;
+    ui.play.textContent = "Play";
+    ui.play.classList.remove("primary");
+    hold = 0;
+    if (progress > 0) { level++; progress = 0; }
+    else if (level < maxLevel()) level++;
+    else level = 0;
+    draw();
+  });
+  ui.reset.addEventListener("click", () => {
+    level = 0; progress = 0; hold = HOLD_MS;
+    draw();
+  });
+  ui.max.addEventListener("input", () => {
+    ui.maxv.textContent = ui.max.value;
+    if (level > maxLevel()) { level = maxLevel(); progress = 0; draw(); }
+  });
+  window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", draw);
+  new ResizeObserver(resize).observe(canvas);
+
+  resize();
+  hold = HOLD_MS;
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
